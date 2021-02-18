@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -18,15 +19,47 @@ type PackageJSON struct {
 	OptionalDependencies map[string]string `json:"optionalDependencies,omitempty"`
 }
 
+type NpmResponse struct {
+	ID   string `json:"_id"`
+	Name string `json:"name"`
+	Time struct {
+		Unpublished NpmResponseUnpublished `json:"unpublished"`
+	} `json:"time"`
+}
+
+type NpmResponseUnpublished struct {
+		Maintainers []struct {
+			Email string `json:"email"`
+			Name  string `json:"name"`
+		} `json:"maintainers"`
+		Name string `json:"name"`
+		Tags struct {
+			Latest string `json:"latest"`
+		} `json:"tags"`
+		Time     time.Time `json:"time"`
+		Versions []string  `json:"versions"`
+}
+
+// NotAvailable returns true if the package has its all versions unpublished making it susceptible for takeover
+func (n *NpmResponse) NotAvailable() bool {
+	// Check if a known field has a value
+	return len(n.Time.Unpublished.Name) > 0
+}
+
 // NPMLookup represents a collection of npm packages to be tested for dependency confusion.
 type NPMLookup struct {
-	Packages []string
+	Packages []NPMPackage
 	Verbose  bool
+}
+
+type NPMPackage struct {
+	Name string
+	Version string
 }
 
 // NewNPMLookup constructs an `NPMLookup` struct and returns it.
 func NewNPMLookup(verbose bool) PackageResolver {
-	return &NPMLookup{Packages: []string{}, Verbose: verbose}
+	return &NPMLookup{Packages: []NPMPackage{}, Verbose: verbose}
 }
 
 // ReadPackagesFromFile reads package information from an npm package.json file
@@ -42,20 +75,24 @@ func (n *NPMLookup) ReadPackagesFromFile(filename string) error {
 	if err != nil {
 		fmt.Printf(" [W] Non-fatal issue encountered while reading %s : %s\n", filename, err)
 	}
-	for pkgname := range data.Dependencies {
-		n.Packages = append(n.Packages, pkgname)
+	for pkgname, pkgversion := range data.Dependencies {
+		n.Packages = append(n.Packages, NPMPackage{pkgname, pkgversion})
 	}
-	for pkgname := range data.DevDependencies {
-		n.Packages = append(n.Packages, pkgname)
+	for pkgname, pkgversion := range data.DevDependencies {
+		n.Packages = append(n.Packages, NPMPackage{pkgname, pkgversion})
 	}
-	for pkgname := range data.PeerDependencies {
-		n.Packages = append(n.Packages, pkgname)
+	for pkgname, pkgversion := range data.PeerDependencies {
+		n.Packages = append(n.Packages, NPMPackage{pkgname, pkgversion})
 	}
-	for pkgname := range data.OptionalDependencies {
-		n.Packages = append(n.Packages, pkgname)
+	for pkgname, pkgversion := range data.OptionalDependencies {
+		n.Packages = append(n.Packages, NPMPackage{pkgname, pkgversion})
 	}
-	n.Packages = append(n.Packages, data.BundledDependencies...)
-	n.Packages = append(n.Packages, data.BundleDependencies...)
+	for _, pkgname := range data.BundledDependencies {
+		n.Packages = append(n.Packages, NPMPackage{pkgname, ""})
+	}
+	for _, pkgname := range data.BundleDependencies {
+		n.Packages = append(n.Packages, NPMPackage{pkgname, ""})
+	}
 	return nil
 }
 
@@ -65,8 +102,19 @@ func (n *NPMLookup) ReadPackagesFromFile(filename string) error {
 func (n *NPMLookup) PackagesNotInPublic() []string {
 	notavail := []string{}
 	for _, pkg := range n.Packages {
-		if !n.isAvailableInPublic(pkg, 0) {
-			notavail = append(notavail, pkg)
+		if n.localReference(pkg.Version) || n.urlReference(pkg.Version) {
+			continue
+		}
+		if n.gitHubReference(pkg.Version) {
+			if !n.gitHubOrgExists(pkg.Version) {
+				notavail = append(notavail, pkg.Name)
+				continue
+			} else {
+				continue
+			}
+		}
+		if !n.isAvailableInPublic(pkg.Name, 0) {
+			notavail = append(notavail, pkg.Name)
 		}
 	}
 	return notavail
@@ -88,16 +136,63 @@ func (n *NPMLookup) isAvailableInPublic(pkgname string, retry int) bool {
 		fmt.Printf(" [W] Error when trying to request https://registry.npmjs.org/"+pkgname+"/ : %s\n", err)
 		return false
 	}
+	defer resp.Body.Close()
 	if n.Verbose {
 		fmt.Printf("%s\n", resp.Status)
 	}
 	if resp.StatusCode == http.StatusOK {
+		npmResp := NpmResponse{}
+		body, _ := ioutil.ReadAll(resp.Body)
+		_ = json.Unmarshal(body, &npmResp)
+		if npmResp.NotAvailable() {
+			if n.Verbose {
+				fmt.Printf("[W] Package %s was found, but all its versions are unpublished, making anyone able to takeover the namespace.\n", pkgname)
+			}
+			return false
+		}
 		return true
 	} else if resp.StatusCode == 429 {
 		fmt.Printf(" [!] Server responded with 429 (Too many requests), throttling and retrying...\n")
 		time.Sleep(10 * time.Second)
 		retry = retry + 1
 		n.isAvailableInPublic(pkgname, retry)
+	}
+	return false
+}
+
+// localReference checks if the package version is in fact a reference to filesystem
+func (n *NPMLookup) localReference(pkgversion string) bool {
+	return strings.HasPrefix(strings.ToLower(pkgversion), "file:")
+}
+
+// urlReference checks if the package version is in fact a reference to a direct URL
+func (n *NPMLookup) urlReference(pkgversion string) bool {
+	pkgversion = strings.ToLower(pkgversion)
+	return strings.HasPrefix(pkgversion, "http:") || strings.HasPrefix(pkgversion, "https:")
+}
+
+// gitHubReference checks if the package version refers to a GitHub repository
+func (n *NPMLookup) gitHubReference(pkgversion string) bool {
+	return !strings.HasPrefix(pkgversion, "@") && strings.Contains(pkgversion, "/")
+}
+
+// gitHubOrgExists returns true if GitHub organization / user exists
+func (n NPMLookup) gitHubOrgExists(pkgversion string) bool {
+	orgName := strings.Split(pkgversion, "/")[0]
+	if len(orgName) > 0 {
+		if n.Verbose {
+			fmt.Print("Checking: https://github.com/" + orgName + " : ")
+		}
+		resp, err := http.Get("https://github.com/" + orgName)
+		if err != nil {
+			fmt.Printf(" [W] Error while trying to request https://github.com/"+orgName+" : %s\n", err)
+			return false
+		}
+		defer resp.Body.Close()
+		if n.Verbose {
+			fmt.Printf("%d\n", resp.StatusCode)
+		}
+		return resp.StatusCode == 200
 	}
 	return false
 }
